@@ -9,7 +9,7 @@
   "pluginApi": 1,
   "main": "main.mjs",
   "contributes": {
-    "panels": [{ "id": "agent", "title": "omp Agent", "icon": "list-checks", "entry": "panel.html" }]
+    "panels": [{ "id": "agent", "title": "omp Agent", "icon": "bot", "entry": "panel.html" }]
   },
   "capabilities": [{ "kind": "workspace:read" }]
 }

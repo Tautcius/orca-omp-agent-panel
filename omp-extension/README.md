@@ -14,7 +14,7 @@ extensions directory:
 
 ```sh
 mkdir -p ~/.omp/agent/extensions
-ln -s "$PWD/omp-extension/orca-omp-agent-panel.ts" ~/.omp/agent/extensions/orca-omp-agent-panel.ts
+ln -s "$PWD/omp-extension/orca-omp-agent-panel.ts" ~/.omp/agent/extensions/omp-agent-panel.ts
 ```
 
 You can also add the absolute path to the `extensions:` list in
