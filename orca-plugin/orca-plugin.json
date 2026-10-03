@@ -1,0 +1,15 @@
+{
+  "manifestVersion": 1,
+  "id": "omp-agent-panel",
+  "publisher": "tautcius",
+  "name": "omp Agent",
+  "version": "0.1.0",
+  "description": "Live todo list and subagent status of the omp session running in the focused worktree.",
+  "engines": { "orca": ">=1.4.0" },
+  "pluginApi": 1,
+  "main": "main.mjs",
+  "contributes": {
+    "panels": [{ "id": "agent", "title": "omp Agent", "icon": "list-checks", "entry": "panel.html" }]
+  },
+  "capabilities": [{ "kind": "workspace:read" }]
+}
