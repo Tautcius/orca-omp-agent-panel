@@ -1,2 +1,3 @@
 orca-plugin/panel.html
 orca-plugin/*.tmp
+node_modules/

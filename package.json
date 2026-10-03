@@ -1,0 +1,12 @@
+{
+  "name": "orca-omp-agent-panel",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "happy-dom": "^20.14.5"
+  }
+}
