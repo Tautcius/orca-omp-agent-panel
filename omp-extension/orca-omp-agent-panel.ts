@@ -26,6 +26,7 @@ type TodoStatus = 'pending' | 'in_progress' | 'completed' | 'abandoned' | 'block
 type TodoTask = { content: string; status: TodoStatus; blocker?: string }
 type TodoPhase = { name: string; tasks: TodoTask[] }
 type SubagentStatus = 'running' | 'completed' | 'failed' | 'aborted'
+type RecentTool = { tool: string; text: string | null; isError: boolean }
 type Subagent = {
   id: string
   agent: string
@@ -34,6 +35,20 @@ type Subagent = {
   startedAt: number
   endedAt: number | null
   model: string | null
+  /** First lines of the spawn assignment, truncated. */
+  assignment: string | null
+  /** Running only: latest intent, else the in-flight tool call. */
+  activity: string | null
+  toolCount: number
+  requests: number
+  tokens: number
+  cost: number
+  /** Context window fill, 0–100. */
+  contextPct: number | null
+  /** omp's completion-probe estimate, 0–100. */
+  completionPct: number | null
+  /** Newest first, at most MAX_RECENT_TOOLS. */
+  recentTools: RecentTool[]
 }
 type SessionStatus = 'working' | 'idle' | 'ended'
 type StateFileV1 = {
@@ -57,7 +72,7 @@ type StateFileV1 = {
 // ---------------------------------------------------------------------------
 
 type Logger = { warn?: (msg: string, meta?: unknown) => void }
-type SessionEntry = { type?: string; customType?: string; data?: unknown; message?: unknown }
+type SessionEntry = { id?: string; type?: string; customType?: string; data?: unknown; message?: unknown }
 type SessionManagerView = {
   getSessionId?: () => string | undefined
   getSessionName?: () => string | undefined
@@ -91,8 +106,18 @@ const LIFECYCLE_CHANNEL = 'task:subagent:lifecycle'
 const PROGRESS_CHANNEL = 'task:subagent:progress'
 // Session custom entry written by `/todo` edits and eval todo commits.
 const USER_TODO_EDIT = 'user_todo_edit'
+// omp's todo HUD visibility entry: `tasks.todoClearDelay` seconds after every task
+// is completed or abandoned, omp appends `{ sourceEntryId, visibility: 'dismissed' }`
+// for the snapshot it hides (interactive/session/todo-hud).
+const TODO_HUD_STATE = 'todo_hud_state'
 
 const WRITE_DEBOUNCE_MS = 150
+// Every panel render replaces Orca's panel iframe (its React key includes the
+// document revision), which blanks the panel until it re-reads the workspace.
+// Progress-only subagent changes (activity, counters, recent tools) therefore
+// wait this long; status/todo/new-subagent changes still flush after WRITE_DEBOUNCE_MS
+// and carry the pending progress with them.
+const PROGRESS_WRITE_MS = 5000
 const LEAF_POLL_MS = 1000
 const LOG_PREFIX = '[orca-omp-agent-panel]'
 // Each panel render reloads the panel and re-runs Orca's dev plugin refresh,
@@ -103,10 +128,30 @@ const ENDED_VISIBLE_MS = 10 * 60_000
 // Files of long-dead sessions are deleted so the directory does not grow forever.
 const STALE_DELETE_MS = 24 * 60 * 60_000
 const MAX_SUBAGENTS_PER_SESSION = 50
+const MAX_RECENT_TOOLS = 3
+const MAX_TEXT_CHARS = 160
+const MAX_ASSIGNMENT_CHARS = 600
 const DATA_PLACEHOLDER = '/*__OMP_AGENT_DATA__*/null'
 
 function stateDir(): string {
   return process.env.ORCA_OMP_PANEL_STATE_DIR || path.join(os.homedir(), '.local/state/orca-omp-agent-panel/sessions')
+}
+
+// Collapses whitespace and truncates; null for anything that is not non-empty text.
+function shortText(value: unknown, max = MAX_TEXT_CHARS): string | null {
+  if (typeof value !== 'string') return null
+  const text = value.replace(/\s+/g, ' ').trim()
+  if (!text) return null
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function percent(value: unknown): number | null {
+  const n = finiteNumber(value)
+  return n === null ? null : Math.max(0, Math.min(100, Math.round(n)))
 }
 
 // The extension is symlinked from the repo, so resolve the real file and use
@@ -153,6 +198,8 @@ function normalizePhases(raw: unknown): TodoPhase[] | undefined {
 
 // Mirrors omp's own restore rule (session/todo-tracker.ts): the latest
 // `user_todo_edit` custom entry or successful non-`view` `todo` tool result wins.
+// A snapshot omp has dismissed from its todo HUD is finished work: publish none,
+// so the panel retires the list at the same moment the terminal does.
 function latestPhasesFromBranch(branch: SessionEntry[] | undefined): TodoPhase[] {
   if (!Array.isArray(branch)) return []
   for (let i = branch.length - 1; i >= 0; i--) {
@@ -168,9 +215,22 @@ function latestPhasesFromBranch(branch: SessionEntry[] | undefined): TodoPhase[]
         phases = normalizePhases(msg.details?.phases)
       }
     }
-    if (phases) return phases
+    if (phases) return hudVisibility(branch, i, entry.id) === 'dismissed' ? [] : phases
   }
   return []
+}
+
+// Latest HUD visibility recorded for the snapshot at `index` (omp: sIe in todo HUD).
+function hudVisibility(branch: SessionEntry[], index: number, sourceId: string | undefined): string | undefined {
+  if (!sourceId) return undefined
+  for (let i = branch.length - 1; i > index; i--) {
+    const entry = branch[i]
+    if (entry.type !== 'custom' || entry.customType !== TODO_HUD_STATE) continue
+    const data = entry.data as { sourceEntryId?: unknown; visibility?: unknown } | undefined
+    if (data?.sourceEntryId !== sourceId) continue
+    if (data.visibility === 'dismissed' || data.visibility === 'revealed') return data.visibility
+  }
+  return undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +240,7 @@ function latestPhasesFromBranch(branch: SessionEntry[] | undefined): TodoPhase[]
 class SessionStateFile {
   readonly state: StateFileV1
   #timer: NodeJS.Timeout | undefined
+  #dueAt = 0
   #ended = false
   readonly #logger: Logger | undefined
 
@@ -205,13 +266,20 @@ class SessionStateFile {
     return this.#ended
   }
 
-  // Debounced + coalesced: the timer reads `this.state` at fire time, so the latest state wins.
-  schedule(): void {
-    if (this.#ended || this.#timer !== undefined) return
+  // Debounced + coalesced: the timer reads `this.state` at fire time, so the latest
+  // state wins. A shorter delay pulls an already pending flush forward.
+  schedule(delayMs = WRITE_DEBOUNCE_MS): void {
+    if (this.#ended) return
+    const dueAt = Date.now() + delayMs
+    if (this.#timer !== undefined) {
+      if (dueAt >= this.#dueAt) return
+      clearTimeout(this.#timer)
+    }
+    this.#dueAt = dueAt
     this.#timer = setTimeout(() => {
       this.#timer = undefined
       this.#flush()
-    }, WRITE_DEBOUNCE_MS)
+    }, delayMs)
     this.#timer.unref?.()
   }
 
@@ -261,10 +329,9 @@ class SessionStateFile {
 // Panel renderer (aggregates every session file, so any omp process can render)
 // ---------------------------------------------------------------------------
 
-type PanelSession = Pick<
-  StateFileV1,
-  'sessionId' | 'terminalHandle' | 'title' | 'status' | 'updatedAt' | 'todoPhases' | 'subagents'
->
+// Only what the panel draws: any other byte (e.g. `updatedAt`) would make every
+// state write a panel reload.
+type PanelSession = Pick<StateFileV1, 'sessionId' | 'terminalHandle' | 'title' | 'status' | 'todoPhases' | 'subagents'>
 
 function isPidAlive(pid: number): boolean {
   try {
@@ -284,7 +351,9 @@ function collectPanelSessions(now: number): PanelSession[] {
   } catch {
     return []
   }
-  const sessions: PanelSession[] = []
+  // One session per terminal: a restart or `/clear` leaves the previous session's
+  // file behind as `ended`, which must not linger next to its successor.
+  const byTerminal = new Map<string, { session: PanelSession; updatedAt: number }>()
   for (const name of names) {
     if (!name.endsWith('.json')) continue
     const file = path.join(dir, name)
@@ -307,18 +376,28 @@ function collectPanelSessions(now: number): PanelSession[] {
     }
     if (status === 'ended' && now - updatedAt > ENDED_VISIBLE_MS) continue
     if (typeof raw.terminalHandle !== 'string') continue // Not started from an Orca terminal.
-    sessions.push({
+    const session: PanelSession = {
       sessionId: raw.sessionId,
       terminalHandle: raw.terminalHandle,
       title: typeof raw.title === 'string' ? raw.title : null,
       status,
-      updatedAt,
       todoPhases: Array.isArray(raw.todoPhases) ? raw.todoPhases : [],
       subagents: Array.isArray(raw.subagents) ? raw.subagents.slice(-MAX_SUBAGENTS_PER_SESSION) : [],
-    })
+    }
+    // A live session beats any ended one; otherwise the latest write wins. Session
+    // ids cannot decide this: a resumed session keeps its older id.
+    const prev = byTerminal.get(raw.terminalHandle)
+    const live = status !== 'ended'
+    const prevLive = prev ? prev.session.status !== 'ended' : false
+    if (!prev || (live && !prevLive) || (live === prevLive && updatedAt > prev.updatedAt)) {
+      byTerminal.set(raw.terminalHandle, { session, updatedAt })
+    }
   }
-  sessions.sort((a, b) => b.updatedAt - a.updatedAt)
-  return sessions
+  // omp session ids are time-ordered UUIDv7: newest session first, and the order
+  // does not flip as sessions take turns writing.
+  return Array.from(byTerminal.values(), (entry) => entry.session).sort((a, b) =>
+    a.sessionId < b.sessionId ? 1 : a.sessionId > b.sessionId ? -1 : 0,
+  )
 }
 
 function renderPanelNow(logger: Logger | undefined): void {
@@ -499,6 +578,15 @@ export default function orcaOmpAgentPanel(pi: ExtensionAPI): void {
         startedAt: Date.now(),
         endedAt: null,
         model: null,
+        assignment: null,
+        activity: null,
+        toolCount: 0,
+        requests: 0,
+        tokens: 0,
+        cost: 0,
+        contextPct: null,
+        completionPct: null,
+        recentTools: [],
       }
       file.state.subagents.push(sub)
     }
@@ -512,7 +600,10 @@ export default function orcaOmpAgentPanel(pi: ExtensionAPI): void {
   //     status: 'started'|'completed'|'failed'|'aborted', sessionFile, index }
   // Progress payload (task/executor.ts, coalesced ~150ms):
   //   { index, agent, agentSource, task, parentToolCallId, detached, assignment, sessionFile,
-  //     progress: { id, agent, status, description, resolvedModel?, modelOverride?, ... } }
+  //     progress: { id, agent, status, description, resolvedModel?, modelOverride?,
+  //       lastIntent?, currentTool?, currentToolArgs?, currentToolIntent?,
+  //       recentTools: [{ tool, args, intent?, isError? }] (newest first),
+  //       toolCount, requests, tokens, cost, contextTokens?, contextWindow?, completionPercent?, ... } }
   function onBusEvent(channel: string, data: unknown): void {
     if (kind === 'sub') {
       activeMainSink?.(channel, data)
@@ -533,6 +624,7 @@ export default function orcaOmpAgentPanel(pi: ExtensionAPI): void {
       } else {
         sub.status = status
         sub.endedAt = Date.now()
+        sub.activity = null
       }
       file.schedule()
       return
@@ -544,22 +636,42 @@ export default function orcaOmpAgentPanel(pi: ExtensionAPI): void {
     // A progress tick for an unknown id only registers it while it is still running.
     if (!known && p.status !== 'running') return
     const sub = known ?? upsertSubagent(file, p.id, p.agent ?? ev.agent, p.description)
-    let changed = !known
+    const before = known ? JSON.stringify(sub) : ''
     const model =
       typeof p.resolvedModel === 'string' && p.resolvedModel
         ? p.resolvedModel
         : typeof p.modelOverride === 'string' && p.modelOverride
           ? p.modelOverride
           : null
-    if (model && sub.model !== model) {
-      sub.model = model
-      changed = true
+    if (model) sub.model = model
+    if (!sub.description && typeof p.description === 'string' && p.description.trim()) sub.description = p.description
+    sub.assignment = shortText(ev.assignment, MAX_ASSIGNMENT_CHARS) ?? sub.assignment
+    const currentTool = shortText(p.currentTool)
+    sub.activity =
+      sub.status === 'running' && p.status === 'running'
+        ? (shortText(p.lastIntent) ??
+          shortText(p.currentToolIntent) ??
+          (currentTool ? shortText(`${currentTool} ${typeof p.currentToolArgs === 'string' ? p.currentToolArgs : ''}`) : null))
+        : null
+    sub.toolCount = finiteNumber(p.toolCount) ?? sub.toolCount
+    sub.requests = finiteNumber(p.requests) ?? sub.requests
+    sub.tokens = finiteNumber(p.tokens) ?? sub.tokens
+    sub.cost = finiteNumber(p.cost) ?? sub.cost
+    const contextTokens = finiteNumber(p.contextTokens)
+    const contextWindow = finiteNumber(p.contextWindow)
+    if (contextTokens !== null && contextWindow) sub.contextPct = percent((contextTokens / contextWindow) * 100)
+    sub.completionPct = percent(p.completionPercent) ?? sub.completionPct
+    if (Array.isArray(p.recentTools)) {
+      sub.recentTools = p.recentTools.slice(0, MAX_RECENT_TOOLS).flatMap((raw): RecentTool[] => {
+        if (!raw || typeof raw !== 'object') return []
+        const t = raw as Record<string, unknown>
+        const tool = shortText(t.tool, 40)
+        if (!tool) return []
+        return [{ tool, text: shortText(t.intent) ?? shortText(t.args), isError: t.isError === true }]
+      })
     }
-    if (!sub.description && typeof p.description === 'string' && p.description.trim()) {
-      sub.description = p.description
-      changed = true
-    }
-    if (changed) file.schedule()
+    // A newly registered subagent is a structural change; later ticks are progress only.
+    if (JSON.stringify(sub) !== before) file.schedule(known ? PROGRESS_WRITE_MS : WRITE_DEBOUNCE_MS)
   }
 
   // Event-bus listeners run outside handler dispatch isolation: never let them throw.

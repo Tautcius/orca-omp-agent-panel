@@ -17,12 +17,13 @@
         background: var(--background, transparent);
       }
       .empty { color: var(--muted-foreground, #999); padding: 16px 0; line-height: 1.5; }
-      .session { margin-bottom: 16px; }
+      .none { color: var(--muted-foreground, #999); padding: 2px 0 4px; }
+      .todos { margin-bottom: 12px; }
       .session-head {
         display: flex;
         align-items: center;
         gap: 6px;
-        margin-bottom: 4px;
+        margin: 8px 0 2px;
         color: var(--muted-foreground, #999);
         font-size: 11px;
       }
@@ -72,13 +73,19 @@
       }
       .sub-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .sub-time { color: var(--muted-foreground, #999); font-variant-numeric: tabular-nums; }
-      .sub-desc, .sub-meta {
+      .sub-desc, .sub-meta, .sub-stats, .sub-activity, .sub-tools {
         grid-column: 2 / 4;
         color: var(--muted-foreground, #999);
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
       }
+      .sub-activity { color: var(--foreground, #ddd); }
+      .sub-activity .pct { color: #3b82f6; margin-right: 4px; font-variant-numeric: tabular-nums; }
+      .sub-stats { font-variant-numeric: tabular-nums; font-size: 11px; }
+      .sub-tools { font-size: 11px; }
+      .sub-tools .tool { font-family: ui-monospace, monospace; color: var(--foreground, #ddd); }
+      .sub-tools .error .tool, .sub-tools .error { color: var(--destructive, #ef4444); }
     </style>
   </head>
   <body>
@@ -147,9 +154,28 @@
         return Math.floor(m / 60) + 'h ' + (m % 60) + 'm'
       }
 
+      function tokens(n) {
+        if (n < 1000) return String(n)
+        if (n < 1e6) return (n / 1000).toFixed(n < 1e4 ? 1 : 0) + 'k'
+        return (n / 1e6).toFixed(1) + 'M'
+      }
+
+      // Fields added after the first schema-v1 release are absent in older state files.
+      function subStats(sub) {
+        var parts = []
+        if (sub.toolCount) parts.push(sub.toolCount + (sub.toolCount === 1 ? ' tool' : ' tools'))
+        if (sub.requests) parts.push(sub.requests + ' req')
+        if (sub.tokens) parts.push(tokens(sub.tokens) + ' tok')
+        if (sub.cost) parts.push('$' + sub.cost.toFixed(2))
+        if (typeof sub.contextPct === 'number') parts.push('ctx ' + sub.contextPct + '%')
+        return parts.join(' · ')
+      }
+
       function renderTodos(box, session) {
-        if (!session.todoPhases.length) return
-        box.appendChild(el('h2', null, 'Todos'))
+        if (!session.todoPhases.length) {
+          box.appendChild(el('div', 'none', 'No todos.'))
+          return
+        }
         session.todoPhases.forEach(function (phase) {
           var done = phase.tasks.filter(function (task) {
             return task.status === 'completed' || task.status === 'abandoned'
@@ -170,29 +196,65 @@
         })
       }
 
-      function renderSubagents(box, session, now) {
-        if (!session.subagents.length) return
-        box.appendChild(el('h2', null, 'Subagents'))
+      // One list across every shown session: running first, then most recently started.
+      function renderSubagents(box, sessions, now) {
+        var subs = []
+        sessions.forEach(function (session) {
+          session.subagents.forEach(function (sub) { subs.push({ sub: sub, session: session }) })
+        })
+        if (!subs.length) return
+        var running = subs.filter(function (entry) { return entry.sub.status === 'running' }).length
+        box.appendChild(el('h2', null, 'Subagents' + (running ? ' · ' + running + ' running' : '')))
         var list = el('ul')
-        // Running first, then most recently started.
-        session.subagents
-          .slice()
-          .sort(function (a, b) {
+        subs
+          .sort(function (x, y) {
+            var a = x.sub
+            var b = y.sub
             var ra = a.status === 'running' ? 0 : 1
             var rb = b.status === 'running' ? 0 : 1
             return ra - rb || (b.startedAt || 0) - (a.startedAt || 0)
           })
-          .forEach(function (sub) {
+          .forEach(function (entry) {
+            var sub = entry.sub
             var item = el('li', 'sub')
             item.appendChild(el('span', 'dot ' + sub.status))
-            item.appendChild(el('span', 'sub-name', sub.id || sub.agent))
+            var name = el('span', 'sub-name', sub.id || sub.agent)
+            if (sub.assignment) name.title = sub.assignment
+            item.appendChild(name)
             var elapsed = sub.startedAt ? (sub.endedAt || now) - sub.startedAt : null
-            item.appendChild(el('span', 'sub-time', elapsed === null ? '' : duration(elapsed)))
+            var time = el('span', 'sub-time', elapsed === null ? '' : duration(elapsed))
+            if (sub.status === 'running' && sub.startedAt) time.dataset.startedAt = String(sub.startedAt)
+            item.appendChild(time)
             if (sub.description) item.appendChild(el('span', 'sub-desc', sub.description))
-            item.appendChild(el('span', 'sub-meta', [sub.agent, sub.status, sub.model].filter(Boolean).join(' · ')))
+            if (sub.status === 'running' && (sub.activity || typeof sub.completionPct === 'number')) {
+              var activity = el('span', 'sub-activity')
+              if (typeof sub.completionPct === 'number') activity.appendChild(el('span', 'pct', '~' + sub.completionPct + '%'))
+              if (sub.activity) {
+                activity.appendChild(document.createTextNode(sub.activity))
+                activity.title = sub.activity
+              }
+              item.appendChild(activity)
+            }
+            var meta = [sub.agent, sub.status, sub.model]
+            // Several sessions share the list: name the owning one.
+            if (sessions.length > 1) meta.unshift(sessionLabel(entry.session))
+            item.appendChild(el('span', 'sub-meta', meta.filter(Boolean).join(' · ')))
+            var stats = subStats(sub)
+            if (stats) item.appendChild(el('span', 'sub-stats', stats))
+            ;(sub.recentTools || []).forEach(function (t) {
+              var line = el('span', 'sub-tools' + (t.isError ? ' error' : ''))
+              line.appendChild(el('span', 'tool', (t.isError ? '✕ ' : '') + t.tool))
+              if (t.text) line.appendChild(document.createTextNode(' ' + t.text))
+              line.title = t.tool + (t.text ? ' ' + t.text : '')
+              item.appendChild(line)
+            })
             list.appendChild(item)
           })
         box.appendChild(list)
+      }
+
+      function sessionLabel(session) {
+        return session.title || 'Untitled session'
       }
 
       function render() {
@@ -201,10 +263,9 @@
           content.appendChild(el('div', 'empty', 'Cannot read workspace: ' + state.contextError))
           return
         }
-        if (!state.terminals) {
-          content.appendChild(el('div', 'empty', 'Loading…'))
-          return
-        }
+        // Every data update is a fresh iframe; stay blank until the first context
+        // read instead of flashing a placeholder text.
+        if (!state.terminals) return
         var sessions = ((DATA && DATA.sessions) || []).filter(function (session) {
           return state.terminals.has(session.terminalHandle)
         })
@@ -215,27 +276,30 @@
           return
         }
         var now = Date.now()
+        // Todos always come first, one block per session, then a single subagent list.
+        var todos = el('section', 'todos')
+        todos.appendChild(el('h2', null, 'Todos'))
         sessions.forEach(function (session) {
-          var box = el('section', 'session')
           var head = el('div', 'session-head')
           head.appendChild(el('span', 'dot ' + session.status))
-          head.appendChild(el('span', 'session-title', session.title || session.sessionId.slice(0, 8)))
+          head.appendChild(el('span', 'session-title', sessionLabel(session)))
           head.appendChild(el('span', null, session.status))
-          box.appendChild(head)
-          renderTodos(box, session)
-          renderSubagents(box, session, now)
-          if (!session.todoPhases.length && !session.subagents.length) {
-            box.appendChild(el('div', 'empty', 'No todos or subagents yet.'))
-          }
-          content.appendChild(box)
+          todos.appendChild(head)
+          renderTodos(todos, session)
         })
+        content.appendChild(todos)
+        renderSubagents(content, sessions, now)
       }
 
       pollContext()
       setInterval(pollContext, CONTEXT_POLL_MS)
-      // Ticks running-subagent durations between reloads.
+      // Ticks running-subagent durations between reloads. Only the time text
+      // changes, so hover tooltips and text selection survive the tick.
       setInterval(function () {
-        if (state.terminals) render()
+        var now = Date.now()
+        document.querySelectorAll('.sub-time[data-started-at]').forEach(function (node) {
+          node.textContent = duration(now - Number(node.dataset.startedAt))
+        })
       }, 1000)
       render()
     </script>
