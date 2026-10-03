@@ -1,11 +1,13 @@
 # orca-omp-agent-panel omp extension
 
 Writes one JSON state file (schema v1) per main omp session with its todo list,
-its subagents, and run status, for the Orca agent panel to read.
+its subagents, and run status, then renders all live sessions into the Orca
+plugin's `panel.html`.
 
 - Directory: `$ORCA_OMP_PANEL_STATE_DIR`, or `~/.local/state/orca-omp-agent-panel/sessions` if that is unset
 - File: `<sessionId>.json`, written atomically (`<file>.<pid>.tmp` then rename), debounced 150 ms
-- Worktree link: `ORCA_WORKTREE_ID` and `ORCA_PANE_KEY` from the omp process environment
+- Worktree link: `ORCA_TERMINAL_HANDLE` (matched by the panel against the focused worktree's terminals); `ORCA_WORKTREE_ID` and `ORCA_PANE_KEY` are recorded too
+- Panel: `$ORCA_OMP_PANEL_PLUGIN_DIR/panel.html` (default `../orca-plugin` next to the real extension file), rendered from `panel.template.html` at most once per second, only when the bytes change. Sessions started outside an Orca terminal are not rendered.
 
 ## Install
 

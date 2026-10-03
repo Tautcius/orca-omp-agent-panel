@@ -1,5 +1,11 @@
 // orca-omp-agent-panel: mirrors the main omp session's todo list and subagent
-// status into one JSON state file per session, consumed by the Orca panel plugin.
+// status into one JSON state file per session, then renders every live
+// session into the Orca panel plugin's `panel.html`.
+//
+// Why render HTML: stock Orca gives sandboxed plugin panels no data channel,
+// but it reloads a dev plugin's panel whenever a file in its folder changes.
+// Rewriting `panel.html` with the data embedded is the only live path that
+// needs no Orca changes.
 //
 // Contract: schema v1, `<stateDir>/<sessionId>.json`, written atomically
 // (`<file>.<pid>.tmp` + rename), debounced/coalesced, final status `ended`.
@@ -10,6 +16,7 @@
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 // ---------------------------------------------------------------------------
 // Contract types
@@ -35,6 +42,8 @@ type StateFileV1 = {
   pid: number
   worktreeId: string | null
   paneKey: string | null
+  /** Orca terminal handle; matches `workspace.readContext().terminals[].id`. */
+  terminalHandle: string | null
   cwd: string
   title: string | null
   status: SessionStatus
@@ -86,6 +95,30 @@ const USER_TODO_EDIT = 'user_todo_edit'
 const WRITE_DEBOUNCE_MS = 150
 const LEAF_POLL_MS = 1000
 const LOG_PREFIX = '[orca-omp-agent-panel]'
+// Each panel render reloads the panel and re-runs Orca's dev plugin refresh,
+// so renders are throttled well below the state-file write rate.
+const RENDER_THROTTLE_MS = 1000
+// Ended sessions stay visible briefly so the final todo state can be read.
+const ENDED_VISIBLE_MS = 10 * 60_000
+// Files of long-dead sessions are deleted so the directory does not grow forever.
+const STALE_DELETE_MS = 24 * 60 * 60_000
+const MAX_SUBAGENTS_PER_SESSION = 50
+const DATA_PLACEHOLDER = '/*__OMP_AGENT_DATA__*/null'
+
+function stateDir(): string {
+  return process.env.ORCA_OMP_PANEL_STATE_DIR || path.join(os.homedir(), '.local/state/orca-omp-agent-panel/sessions')
+}
+
+// The extension is symlinked from the repo, so resolve the real file and use
+// the sibling `orca-plugin/` folder unless overridden.
+function pluginDir(): string | null {
+  if (process.env.ORCA_OMP_PANEL_PLUGIN_DIR) return process.env.ORCA_OMP_PANEL_PLUGIN_DIR
+  try {
+    return path.resolve(path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))), '../orca-plugin')
+  } catch {
+    return null
+  }
+}
 
 const TODO_STATUSES: Record<TodoStatus, true> = {
   pending: true,
@@ -158,6 +191,7 @@ class SessionStateFile {
       pid: process.pid,
       worktreeId: process.env.ORCA_WORKTREE_ID || null,
       paneKey: process.env.ORCA_PANE_KEY || null,
+      terminalHandle: process.env.ORCA_TERMINAL_HANDLE || null,
       cwd,
       title: null,
       status: 'idle',
@@ -196,6 +230,7 @@ class SessionStateFile {
     this.state.status = 'ended'
     this.#flush()
     this.#ended = true
+    renderPanelNow(this.#logger)
   }
 
   // Writes are synchronous (small file, at most one per debounce window) so an
@@ -203,14 +238,14 @@ class SessionStateFile {
   #flush(): void {
     if (this.#ended) return
     try {
-      // Orca plugin workers only see HOME, so XDG_STATE_HOME is deliberately ignored.
-      const dir = process.env.ORCA_OMP_PANEL_STATE_DIR || path.join(os.homedir(), '.local/state/orca-omp-agent-panel/sessions')
+      const dir = stateDir()
       const file = path.join(dir, `${this.state.sessionId.replace(/[^A-Za-z0-9._-]/g, '_')}.json`)
       const tmp = `${file}.${process.pid}.tmp`
       this.state.updatedAt = Date.now()
       fs.mkdirSync(dir, { recursive: true })
       fs.writeFileSync(tmp, JSON.stringify(this.state, null, 2))
       fs.renameSync(tmp, file)
+      schedulePanelRender(this.#logger)
     } catch (error) {
       try {
         this.#logger?.warn?.(`${LOG_PREFIX} failed to write state file`, {
@@ -220,6 +255,116 @@ class SessionStateFile {
       } catch {}
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Panel renderer (aggregates every session file, so any omp process can render)
+// ---------------------------------------------------------------------------
+
+type PanelSession = Pick<
+  StateFileV1,
+  'sessionId' | 'terminalHandle' | 'title' | 'status' | 'updatedAt' | 'todoPhases' | 'subagents'
+>
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    // EPERM: the process exists but belongs to another user.
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+function collectPanelSessions(now: number): PanelSession[] {
+  const dir = stateDir()
+  let names: string[]
+  try {
+    names = fs.readdirSync(dir)
+  } catch {
+    return []
+  }
+  const sessions: PanelSession[] = []
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue
+    const file = path.join(dir, name)
+    let raw: Partial<StateFileV1>
+    try {
+      raw = JSON.parse(fs.readFileSync(file, 'utf8'))
+    } catch {
+      continue // Raced with a writer's rename/delete, or a foreign file.
+    }
+    if (raw?.version !== 1 || typeof raw.sessionId !== 'string') continue
+    let status: SessionStatus = raw.status === 'working' || raw.status === 'idle' ? raw.status : 'ended'
+    // A crashed omp never writes `ended`; a dead pid is the only signal.
+    if (status !== 'ended' && typeof raw.pid === 'number' && !isPidAlive(raw.pid)) status = 'ended'
+    const updatedAt = typeof raw.updatedAt === 'number' ? raw.updatedAt : 0
+    if (status === 'ended' && now - updatedAt > STALE_DELETE_MS) {
+      try {
+        fs.unlinkSync(file)
+      } catch {}
+      continue
+    }
+    if (status === 'ended' && now - updatedAt > ENDED_VISIBLE_MS) continue
+    if (typeof raw.terminalHandle !== 'string') continue // Not started from an Orca terminal.
+    sessions.push({
+      sessionId: raw.sessionId,
+      terminalHandle: raw.terminalHandle,
+      title: typeof raw.title === 'string' ? raw.title : null,
+      status,
+      updatedAt,
+      todoPhases: Array.isArray(raw.todoPhases) ? raw.todoPhases : [],
+      subagents: Array.isArray(raw.subagents) ? raw.subagents.slice(-MAX_SUBAGENTS_PER_SESSION) : [],
+    })
+  }
+  sessions.sort((a, b) => b.updatedAt - a.updatedAt)
+  return sessions
+}
+
+function renderPanelNow(logger: Logger | undefined): void {
+  clearTimeout(renderTimer)
+  renderTimer = undefined
+  lastRenderAt = Date.now()
+  const dir = pluginDir()
+  if (!dir) return
+  try {
+    const template = fs.readFileSync(path.join(dir, 'panel.template.html'), 'utf8')
+    // JSON inside <script>: escape `<` so data can never close the tag, plus
+    // the line separators that are invalid in JS string literals.
+    const data = JSON.stringify({ sessions: collectPanelSessions(Date.now()) })
+      .replace(/</g, '\\u003c')
+      .replace(/\u2028/g, '\\u2028')
+      .replace(/\u2029/g, '\\u2029')
+    const html = template.replace(DATA_PLACEHOLDER, () => data)
+    const target = path.join(dir, 'panel.html')
+    let current: string | null = null
+    try {
+      current = fs.readFileSync(target, 'utf8')
+    } catch {}
+    // Unchanged bytes must not touch the file: every write reloads the panel.
+    if (current === html) return
+    const tmp = `${target}.${process.pid}.tmp`
+    fs.writeFileSync(tmp, html)
+    fs.renameSync(tmp, target)
+  } catch (error) {
+    try {
+      logger?.warn?.(`${LOG_PREFIX} failed to render panel`, {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    } catch {}
+  }
+}
+
+let renderTimer: NodeJS.Timeout | undefined
+let lastRenderAt = 0
+
+// Leading + trailing throttle: the first change renders at once, a burst
+// collapses into one render per RENDER_THROTTLE_MS with the latest state.
+function schedulePanelRender(logger: Logger | undefined): void {
+  if (renderTimer !== undefined) return
+  const wait = Math.max(0, lastRenderAt + RENDER_THROTTLE_MS - Date.now())
+  renderTimer = setTimeout(() => renderPanelNow(logger), wait)
+  renderTimer.unref?.()
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +453,8 @@ export default function orcaOmpAgentPanel(pi: ExtensionAPI): void {
       activeMainSink = onBusEvent
       refreshTodosFromBranch(ctx)
       startLeafPoll()
+      // Show the session in the panel before its first todo or subagent.
+      current.schedule()
     }
     refreshMeta(ctx)
     return current

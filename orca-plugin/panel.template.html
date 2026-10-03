@@ -2,53 +2,27 @@
 <html>
   <head>
     <meta charset="utf-8" />
+    <!-- Template: the omp extension renders panel.html from this file with the
+         live session data in place of the placeholder below. Stock Orca reloads
+         a dev plugin's panel whenever panel.html changes. -->
     <style>
       /* Orca injects its design tokens as CSS custom properties. */
       * { box-sizing: border-box; }
       body {
         margin: 0;
+        padding: 8px 12px 16px;
         font-family: system-ui, sans-serif;
         font-size: 12px;
         color: var(--foreground, #ddd);
         background: var(--background, transparent);
       }
-      .tabs {
-        display: flex;
-        gap: 2px;
-        padding: 6px 8px 0;
-        border-bottom: 1px solid var(--border, #444);
-        position: sticky;
-        top: 0;
-        background: var(--background, #1e1e1e);
-      }
-      .tab {
-        padding: 5px 10px;
-        border: 0;
-        border-bottom: 2px solid transparent;
-        background: none;
-        color: var(--muted-foreground, #999);
-        font: inherit;
-        cursor: pointer;
-      }
-      .tab[aria-selected='true'] {
-        color: var(--foreground, #ddd);
-        border-bottom-color: var(--foreground, #ddd);
-      }
-      .count {
-        margin-left: 4px;
-        padding: 0 5px;
-        border-radius: 8px;
-        background: var(--muted, #333);
-        font-size: 10px;
-      }
-      main { padding: 8px 12px 16px; }
       .empty { color: var(--muted-foreground, #999); padding: 16px 0; line-height: 1.5; }
-      .session { margin-bottom: 14px; }
+      .session { margin-bottom: 16px; }
       .session-head {
         display: flex;
         align-items: center;
         gap: 6px;
-        margin-bottom: 6px;
+        margin-bottom: 4px;
         color: var(--muted-foreground, #999);
         font-size: 11px;
       }
@@ -58,6 +32,7 @@
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
+        flex: 1;
       }
       .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: #888; }
       .dot.working, .dot.running { background: #3b82f6; animation: pulse 1.2s ease-in-out infinite; }
@@ -65,7 +40,15 @@
       .dot.failed { background: var(--destructive, #ef4444); }
       .dot.ended, .dot.aborted { background: #6b7280; }
       @keyframes pulse { 50% { opacity: 0.35; } }
-      .phase { margin: 8px 0 4px; font-weight: 600; font-size: 11px; }
+      h2 {
+        margin: 10px 0 2px;
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--muted-foreground, #999);
+      }
+      .phase { margin: 6px 0 2px; font-weight: 600; font-size: 11px; }
       .phase .progress { color: var(--muted-foreground, #999); font-weight: normal; margin-left: 4px; }
       ul { list-style: none; margin: 0; padding: 0; }
       li.task { display: flex; gap: 6px; padding: 2px 0; line-height: 1.45; }
@@ -99,21 +82,15 @@
     </style>
   </head>
   <body>
-    <nav class="tabs" role="tablist">
-      <button class="tab" role="tab" data-tab="todos" aria-selected="true">
-        Todos<span class="count" id="count-todos">0</span>
-      </button>
-      <button class="tab" role="tab" data-tab="subagents" aria-selected="false">
-        Subagents<span class="count" id="count-subagents">0</span>
-      </button>
-    </nav>
     <main id="content"></main>
     <script>
       'use strict'
+      var DATA = /*__OMP_AGENT_DATA__*/null
       var CONTEXT_POLL_MS = 1500
       var MARKS = { pending: '○', in_progress: '◐', completed: '✓', abandoned: '✕', blocked: '⊘' }
 
-      var state = { tab: 'todos', worktreeId: undefined, contextError: null, snapshot: null }
+      // terminals: Set of handles in the focused worktree; undefined until the first read.
+      var state = { terminals: undefined, contextError: null }
       var content = document.getElementById('content')
       var seq = 0
       var pending = {}
@@ -139,37 +116,26 @@
       window.addEventListener('message', function (event) {
         if (event.source !== window.parent) return
         var data = event.data
-        if (!data) return
-        if (data.type === 'orca-panel-action-result') {
-          var resolve = pending[data.requestId]
-          if (resolve) {
-            delete pending[data.requestId]
-            resolve(data)
-          }
-          return
-        }
-        if (data.type === 'orca-panel-data') {
-          state.snapshot = data.data
-          render()
+        if (!data || data.type !== 'orca-panel-action-result') return
+        var resolve = pending[data.requestId]
+        if (resolve) {
+          delete pending[data.requestId]
+          resolve(data)
         }
       })
 
+      // Focus changes do not reload the panel, so the worktree is polled.
       function pollContext() {
         call('workspace.readContext').then(function (result) {
-          var next = result.ok ? (result.value ? result.value.worktreeId : null) : undefined
           var error = result.ok ? null : result.error || result.errorCode
-          if (next !== state.worktreeId || error !== state.contextError) {
-            state.worktreeId = next
-            state.contextError = error
-            render()
-          }
-        })
-      }
-
-      function visibleSessions() {
-        var sessions = (state.snapshot && state.snapshot.sessions) || []
-        return sessions.filter(function (session) {
-          return state.worktreeId && session.worktreeId === state.worktreeId
+          var handles = result.ok && result.value
+            ? result.value.terminals.map(function (t) { return t.id }).sort().join('\n')
+            : ''
+          var previous = state.terminals ? Array.from(state.terminals).sort().join('\n') : null
+          if (handles === previous && error === state.contextError) return
+          state.terminals = new Set(handles ? handles.split('\n') : [])
+          state.contextError = error
+          render()
         })
       }
 
@@ -181,21 +147,9 @@
         return Math.floor(m / 60) + 'h ' + (m % 60) + 'm'
       }
 
-      function sessionHead(session) {
-        var head = el('div', 'session-head')
-        head.appendChild(el('span', 'dot ' + session.status))
-        head.appendChild(el('span', 'session-title', session.title || session.sessionId.slice(0, 8)))
-        head.appendChild(el('span', null, session.status))
-        return head
-      }
-
-      function renderTodos(session) {
-        var box = el('section', 'session')
-        box.appendChild(sessionHead(session))
-        if (!session.todoPhases.length) {
-          box.appendChild(el('div', 'empty', 'No todos yet.'))
-          return box
-        }
+      function renderTodos(box, session) {
+        if (!session.todoPhases.length) return
+        box.appendChild(el('h2', null, 'Todos'))
         session.todoPhases.forEach(function (phase) {
           var done = phase.tasks.filter(function (task) {
             return task.status === 'completed' || task.status === 'abandoned'
@@ -214,68 +168,46 @@
           })
           box.appendChild(list)
         })
-        return box
       }
 
-      function renderSubagents(session, now) {
-        var box = el('section', 'session')
-        box.appendChild(sessionHead(session))
-        if (!session.subagents.length) {
-          box.appendChild(el('div', 'empty', 'No subagents in this session.'))
-          return box
-        }
+      function renderSubagents(box, session, now) {
+        if (!session.subagents.length) return
+        box.appendChild(el('h2', null, 'Subagents'))
         var list = el('ul')
         // Running first, then most recently started.
-        var subs = session.subagents.slice().sort(function (a, b) {
-          var ra = a.status === 'running' ? 0 : 1
-          var rb = b.status === 'running' ? 0 : 1
-          return ra - rb || (b.startedAt || 0) - (a.startedAt || 0)
-        })
-        subs.forEach(function (sub) {
-          var item = el('li', 'sub')
-          item.appendChild(el('span', 'dot ' + sub.status))
-          item.appendChild(el('span', 'sub-name', sub.id || sub.agent))
-          var elapsed = sub.startedAt ? (sub.endedAt || now) - sub.startedAt : null
-          item.appendChild(el('span', 'sub-time', elapsed === null ? '' : duration(elapsed)))
-          if (sub.description) item.appendChild(el('span', 'sub-desc', sub.description))
-          var meta = [sub.agent, sub.status, sub.model].filter(Boolean).join(' · ')
-          item.appendChild(el('span', 'sub-meta', meta))
-          list.appendChild(item)
-        })
+        session.subagents
+          .slice()
+          .sort(function (a, b) {
+            var ra = a.status === 'running' ? 0 : 1
+            var rb = b.status === 'running' ? 0 : 1
+            return ra - rb || (b.startedAt || 0) - (a.startedAt || 0)
+          })
+          .forEach(function (sub) {
+            var item = el('li', 'sub')
+            item.appendChild(el('span', 'dot ' + sub.status))
+            item.appendChild(el('span', 'sub-name', sub.id || sub.agent))
+            var elapsed = sub.startedAt ? (sub.endedAt || now) - sub.startedAt : null
+            item.appendChild(el('span', 'sub-time', elapsed === null ? '' : duration(elapsed)))
+            if (sub.description) item.appendChild(el('span', 'sub-desc', sub.description))
+            item.appendChild(el('span', 'sub-meta', [sub.agent, sub.status, sub.model].filter(Boolean).join(' · ')))
+            list.appendChild(item)
+          })
         box.appendChild(list)
-        return box
       }
 
       function render() {
-        var sessions = visibleSessions()
-        var openTodos = 0
-        var running = 0
-        sessions.forEach(function (session) {
-          session.todoPhases.forEach(function (phase) {
-            phase.tasks.forEach(function (task) {
-              if (task.status === 'pending' || task.status === 'in_progress' || task.status === 'blocked') openTodos++
-            })
-          })
-          session.subagents.forEach(function (sub) {
-            if (sub.status === 'running') running++
-          })
-        })
-        document.getElementById('count-todos').textContent = openTodos
-        document.getElementById('count-subagents').textContent = running
-
         content.replaceChildren()
         if (state.contextError) {
           content.appendChild(el('div', 'empty', 'Cannot read workspace: ' + state.contextError))
           return
         }
-        if (state.worktreeId === undefined || !state.snapshot) {
+        if (!state.terminals) {
           content.appendChild(el('div', 'empty', 'Loading…'))
           return
         }
-        if (!state.worktreeId) {
-          content.appendChild(el('div', 'empty', 'No worktree focused.'))
-          return
-        }
+        var sessions = ((DATA && DATA.sessions) || []).filter(function (session) {
+          return state.terminals.has(session.terminalHandle)
+        })
         if (!sessions.length) {
           content.appendChild(
             el('div', 'empty', 'No omp session in this worktree. Start omp in an Orca terminal here.')
@@ -284,27 +216,26 @@
         }
         var now = Date.now()
         sessions.forEach(function (session) {
-          content.appendChild(
-            state.tab === 'todos' ? renderTodos(session) : renderSubagents(session, now)
-          )
+          var box = el('section', 'session')
+          var head = el('div', 'session-head')
+          head.appendChild(el('span', 'dot ' + session.status))
+          head.appendChild(el('span', 'session-title', session.title || session.sessionId.slice(0, 8)))
+          head.appendChild(el('span', null, session.status))
+          box.appendChild(head)
+          renderTodos(box, session)
+          renderSubagents(box, session, now)
+          if (!session.todoPhases.length && !session.subagents.length) {
+            box.appendChild(el('div', 'empty', 'No todos or subagents yet.'))
+          }
+          content.appendChild(box)
         })
       }
 
-      document.querySelectorAll('.tab').forEach(function (button) {
-        button.addEventListener('click', function () {
-          state.tab = button.getAttribute('data-tab')
-          document.querySelectorAll('.tab').forEach(function (other) {
-            other.setAttribute('aria-selected', String(other === button))
-          })
-          render()
-        })
-      })
-
       pollContext()
       setInterval(pollContext, CONTEXT_POLL_MS)
-      // Ticks running-subagent durations between data pushes.
+      // Ticks running-subagent durations between reloads.
       setInterval(function () {
-        if (state.tab === 'subagents') render()
+        if (state.terminals) render()
       }, 1000)
       render()
     </script>

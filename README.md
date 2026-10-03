@@ -1,23 +1,30 @@
 # orca-omp-agent-panel
 
-Live todo list and subagent status of the omp session running in the focused Orca worktree, shown as a tab in Orca's right sidebar.
+Live todo list and subagent status of the omp session running in the focused Orca worktree, shown as a tab in Orca's right sidebar. Works with stock Orca and stock omp; no upstream changes.
 
 ```
-omp extension ──JSON state files──▶ Orca plugin worker ──orca.panels.publish──▶ sidebar panel
-(omp-extension/)  ~/.local/state/       (orca-plugin/main.mjs)                    (orca-plugin/panel.html)
-                  orca-omp-agent-panel/
-                  sessions/<id>.json
+omp extension ──state files──▶ same extension renders ──▶ orca-plugin/panel.html ──▶ Orca reloads the
+(every omp     ~/.local/state/   all live sessions into     (generated, gitignored)    dev plugin panel
+ process)      orca-omp-agent-panel/sessions/<id>.json                                  on file change
 ```
 
-- `omp-extension/`: an omp extension that writes one state file per main session (todo phases, subagents, run status, `ORCA_WORKTREE_ID`). See its README for the schema and install steps.
-- `orca-plugin/`: an Orca plugin. The worker watches the state directory and publishes every live session. The panel matches sessions to the focused worktree using `workspace.readContext().worktreeId` and renders **Todos** and **Subagents** tabs.
+- `omp-extension/`: an omp extension. It writes one state file per main session (todo phases, subagents, run status, `ORCA_TERMINAL_HANDLE`), then renders every live session from all state files into `orca-plugin/panel.html` using `orca-plugin/panel.template.html`. At most one render per second, and only when the bytes change.
+- `orca-plugin/`: a panel-only Orca plugin (no worker, capability `workspace:read`). The panel shows sessions whose terminal handle is one of the focused worktree's terminals (`workspace.readContext().terminals[].id`).
 
-## Requirements
+## Why it works this way
 
-The plugin needs two Orca plugin API additions that are not in a released Orca yet: `orca.panels.publish` (worker → panel push) and `worktreeId` in `workspace.readContext`. Both are on branch `feat/plugin-panel-publish` of the Orca fork. On an Orca build without them, the worker logs that `orca.panels.publish` is missing and the panel stays on "Loading…".
+Stock Orca gives sandboxed plugin panels no data channel: no network (`connect-src 'none'`), and panels can only call `workspace.readContext`, `terminal.sendText` and `notifications.show`. Orca does, however, reload a **development** plugin's panel whenever a file in its folder changes. Rewriting `panel.html` with the data embedded is the live path that needs no Orca changes.
+
+Consequences:
+- The plugin must be loaded as a development plugin. Installed plugins are hash-verified, so their files cannot change.
+- Every update reloads the panel document: about 1–2.5 s latency and a brief re-render. This relies on undocumented dev-mode behaviour that a future Orca update could change.
+- Ended sessions stay visible for 10 minutes. State files of sessions that ended more than 24 h ago are deleted on the next render.
 
 ## Install
 
-1. omp: `ln -s "$PWD/omp-extension/orca-omp-agent-panel.ts" ~/.omp/agent/extensions/omp-agent-panel.ts`
-2. Orca: Settings → Plugins → turn on **Plugin system**, then Development → **Development plugin folder path** = absolute path of `orca-plugin/`. Click **Review & enable**.
-3. Open the bot icon in the right sidebar and start `omp` in an Orca terminal of that worktree.
+1. omp: `ln -s "$PWD/omp-extension/orca-omp-agent-panel.ts" ~/.omp/agent/extensions/omp-agent-panel.ts`. Do not use an `orca-*` name; Orca manages those files.
+2. Orca: Settings → Plugins → turn on **Plugin system**. Under Development, set **Development plugin folder path** to the absolute path of `orca-plugin/`. Click **Review & enable**.
+3. Start `omp` in an Orca terminal. The first session renders `panel.html`; until then the panel reports that it could not be loaded.
+4. Open the bot icon in the right sidebar.
+
+`ORCA_OMP_PANEL_STATE_DIR` and `ORCA_OMP_PANEL_PLUGIN_DIR` override the state directory and the plugin folder (default: `../orca-plugin` next to the real extension file).
